@@ -4,7 +4,7 @@ A Speaker handles audio output from Dingdang to the user
 
 Speaker methods:
     say - output 'phrase' as speech
-    play - play the audio in 'filename'
+    player - player the audio in 'filename'
     is_available - returns True if the platform supports this implementation
 """
 from __future__ import print_function
@@ -12,25 +12,28 @@ from __future__ import absolute_import
 import os
 import platform
 import tempfile
-import subprocess
-import pipes
 import logging
-import urllib
 import requests
 import datetime
 import base64
 import hmac
 import hashlib
-import md5
+import json
+import time
 from dateutil import parser as dparser
 from abc import ABCMeta, abstractmethod
 from uuid import getnode as get_mac
+try:
+    import urllib.parse as parse
+except ImportError:
+    import urllib as parse
 
 import argparse
-import yaml
 
 from . import diagnose
 from . import dingdangpath
+from . import config
+from . import player
 
 try:
     import gtts
@@ -59,8 +62,9 @@ class AbstractTTSEngine(object):
 
     @classmethod
     def get_instance(cls):
-        config = cls.get_config()
-        instance = cls(**config)
+        param = cls.get_config()
+        print(param)
+        instance = cls(**param)
         return instance
 
     @classmethod
@@ -76,15 +80,12 @@ class AbstractTTSEngine(object):
         pass
 
     def play(self, filename):
-        cmd = ['aplay', str(filename)]
-        self._logger.debug('Executing %s', ' '.join([pipes.quote(arg)
-                                                     for arg in cmd]))
-        with tempfile.TemporaryFile() as f:
-            subprocess.call(cmd, stdout=f, stderr=f)
-            f.seek(0)
-            output = f.read()
-            if output:
-                self._logger.debug("Output was: '%s'", output)
+        """
+        The method has deprecated, use 'mic.Mic.play' instead.
+        play wave by aplay
+        """
+        sound = player.get_sound_manager()
+        sound.play_block(filename)
 
 
 class AbstractMp3TTSEngine(AbstractTTSEngine):
@@ -99,16 +100,8 @@ class AbstractMp3TTSEngine(AbstractTTSEngine):
                 diagnose.check_python_import('mad'))
 
     def play_mp3(self, filename, remove=False):
-        cmd = ['play', str(filename)]
-        self._logger.debug('Executing %s', ' '.join([pipes.quote(arg)
-                                                     for arg in cmd]))
-        with tempfile.TemporaryFile() as f:
-            p = subprocess.Popen(cmd, stdout=f, stderr=f)
-            p.wait()
-            f.seek(0)
-            output = f.read()
-            if output:
-                self._logger.debug("Output was: '%s'", output)
+        music = player.get_music_manager()
+        music.play_block(filename)
 
     def removePunctuation(self, phrase):
         to_remove = [
@@ -121,9 +114,11 @@ class AbstractMp3TTSEngine(AbstractTTSEngine):
 
     def say(self, phrase, cache=False):
         self._logger.debug(u"Saying '%s' with '%s'", phrase, self.SLUG)
+        h = hashlib.md5()
+        h.update(phrase)
         cache_file_path = os.path.join(
             dingdangpath.TEMP_PATH,
-            self.SLUG + md5.new(phrase).hexdigest() + '.mp3'
+            self.SLUG + h.hexdigest() + '.mp3'
         )
         if cache and os.path.exists(cache_file_path):
             self._logger.info(
@@ -141,19 +136,9 @@ class AbstractMp3TTSEngine(AbstractTTSEngine):
                 else:
                     os.remove(tmpfile)
 
-
-class SimpleMp3Player(AbstractMp3TTSEngine):
-    """
-    MP3 player for playing mp3 files
-    """
-    SLUG = "mp3-player"
-
-    @classmethod
-    def is_available(cls):
-        return True
-
-    def say(self, phrase, cache=False):
-        self._logger.info(phrase)
+    def get_speech(self, phrase):
+        # The subclass needs to implement
+        return None
 
 
 class BaiduTTS(AbstractMp3TTSEngine):
@@ -161,7 +146,7 @@ class BaiduTTS(AbstractMp3TTSEngine):
     使用百度语音合成技术
     要使用本模块, 首先到 yuyin.baidu.com 注册一个开发者账号,
     之后创建一个新应用, 然后在应用管理的"查看key"中获得 API Key 和 Secret Key
-    填入 profile.xml 中.
+    填入 profile.yml 中.
     ...
         baidu_yuyin: 'AIzaSyDoHmTEToZUQrltmORWS4Ott0OHVA62tw8'
             api_key: 'LMFYhLdXSSthxCNLR7uxFszQ'
@@ -171,7 +156,8 @@ class BaiduTTS(AbstractMp3TTSEngine):
 
     SLUG = "baidu-tts"
 
-    def __init__(self, api_key, secret_key, per=0):
+    def __init__(self, api_key, secret_key, per=0, **args):
+        super(self.__class__, self).__init__()
         self._logger = logging.getLogger(__name__)
         self.api_key = api_key
         self.secret_key = secret_key
@@ -180,24 +166,8 @@ class BaiduTTS(AbstractMp3TTSEngine):
 
     @classmethod
     def get_config(cls):
-        # FIXME: Replace this as soon as we have a config module
-        config = {}
         # Try to get baidu_yuyin config from config
-        profile_path = dingdangpath.config('profile.yml')
-        if os.path.exists(profile_path):
-            with open(profile_path, 'r') as f:
-                profile = yaml.safe_load(f)
-                if 'baidu_yuyin' in profile:
-                    if 'api_key' in profile['baidu_yuyin']:
-                        config['api_key'] = \
-                            profile['baidu_yuyin']['api_key']
-                    if 'secret_key' in profile['baidu_yuyin']:
-                        config['secret_key'] = \
-                            profile['baidu_yuyin']['secret_key']
-                    if 'per' in profile['baidu_yuyin']:
-                        config['per'] = \
-                            profile['baidu_yuyin']['per']
-        return config
+        return config.get('baidu_yuyin', {})
 
     @classmethod
     def is_available(cls):
@@ -219,9 +189,9 @@ class BaiduTTS(AbstractMp3TTSEngine):
         finally:
             cache.close()
         URL = 'http://openapi.baidu.com/oauth/2.0/token'
-        params = urllib.urlencode({'grant_type': 'client_credentials',
-                                   'client_id': self.api_key,
-                                   'client_secret': self.secret_key})
+        params = parse.urlencode({'grant_type': 'client_credentials',
+                                  'client_id': self.api_key,
+                                  'client_secret': self.secret_key})
         r = requests.get(URL, params=params)
         try:
             r.raise_for_status()
@@ -270,68 +240,88 @@ class BaiduTTS(AbstractMp3TTSEngine):
 class IFlyTekTTS(AbstractMp3TTSEngine):
     """
     使用讯飞的语音合成技术
-    要使用本模块, 请先在 profile.xml 中启用本模块并选择合适的发音人.
+    要使用本模块, 请先在 profile.yml 中启用本模块并选择合适的发音人.
     """
 
     SLUG = "iflytek-tts"
 
-    def __init__(self, vid='60170'):
+    def __init__(self, api_id, api_key, proxy='', voice_name='xiaoyan',
+                 speed='50', volume='80', pitch='50', **args):
+        super(self.__class__, self).__init__()
         self._logger = logging.getLogger(__name__)
-        self.vid = vid
+        self.api_id = api_id
+        self.api_key = api_key
+        self.proxy = proxy
+        self.voice_name = voice_name
+        self.speed = str(speed)
+        self.volume = str(volume)
+        self.pitch = str(pitch)
 
     @classmethod
     def get_config(cls):
-        # FIXME: Replace this as soon as we have a config module
-        config = {}
         # Try to get iflytek_yuyin config from config
-        profile_path = dingdangpath.config('profile.yml')
-        if os.path.exists(profile_path):
-            with open(profile_path, 'r') as f:
-                profile = yaml.safe_load(f)
-                if 'iflytek_yuyin' in profile:
-                    if 'vid' in profile['iflytek_yuyin']:
-                        config['vid'] = \
-                            profile['iflytek_yuyin']['vid']
-        return config
+        param = config.get('/iflytek_yuyin/tts', {})
+        if 'api_id' not in param or not param['api_id']:
+            param['api_id'] = config.get('/iflytek_yuyin/api_id')
+        return param
 
     @classmethod
     def is_available(cls):
         return diagnose.check_network_connection()
 
-    def split_sentences(self, text):
-        punctuations = ['.', '。', ';', '；', '\n']
-        for i in punctuations:
-            text = text.replace(i, '@@@')
-        return text.split('@@@')
-
     def get_speech(self, phrase):
-        getinfo_url = 'http://www.peiyinge.com/make/getSynthSign'
-        voice_baseurl = 'http://proxy.peiyinge.com:17063/synth?ts='
-        data = {
-            'content': phrase.encode('utf8')
+        url = 'http://api.xfyun.cn/v1/service/v1/tts'
+        param = {
+            'auf': 'audio/L16;rate=16000',
+            'aue': 'lame',
+            'voice_name': self.voice_name,
+            'speed': self.speed,
+            'volume': self.volume,
+            'pitch': self.pitch
         }
-        result_info = requests.post(getinfo_url, data=data).json()
-        content = urllib.quote(phrase.encode('utf8'))
-        ts = result_info['ts']
-        sign = result_info['sign']
-        voice_url = voice_baseurl + ts + '&sign=' + sign + \
-            '&vid=' + self.vid + '&volume=&speed=0&content=' + content
-        r = requests.get(voice_url)
+        xparam = base64.b64encode(json.dumps(param))
+        curTime = str(int(time.time()))
+        h = hashlib.md5()
+        h.update(self.api_key + curTime + xparam)
+        header = {
+            'X-Appid': self.api_id,
+            'X-CurTime': curTime,
+            'X-Param': xparam,
+            'X-CheckSum': h.hexdigest(),
+            'Content-Type': 'application/x-www-form-urlencoded; charset=utf-8'
+        }
+        data = {
+            'text': phrase.encode('utf8')
+        }
+        if self.proxy:
+            session = requests.session()
+            session.proxies = {
+                'http': self.proxy,
+                'https': self.proxy
+            }
+            resp = session.post(url, data=parse.urlencode(data),
+                                headers=header, )
+        else:
+            resp = requests.post(url, data=parse.urlencode(data),
+                                 headers=header)
+        if resp.headers['Content-Type'] != 'audio/mpeg':
+            self._logger.error("get tts by xunfei error, resp:%s", resp.text)
+            return None
         with tempfile.NamedTemporaryFile(suffix='.mp3', delete=False) as f:
-            f.write(r.content)
-            tmpfile = f.name
-            return tmpfile
+            f.write(resp.content)
+            return f.name
 
 
 class ALiBaBaTTS(AbstractMp3TTSEngine):
     """
     使用阿里云的语音合成技术
-    要使用本模块, 请先在 profile.xml 中启用本模块并选择合适的发音人.
+    要使用本模块, 请先在 profile.yml 中启用本模块并选择合适的发音人.
     """
 
     SLUG = "ali-tts"
 
-    def __init__(self, ak_id, ak_secret, voice_name='xiaoyun'):
+    def __init__(self, ak_id, ak_secret, voice_name='xiaoyun', **args):
+        super(self.__class__, self).__init__()
         self._logger = logging.getLogger(__name__)
         self.ak_id = ak_id
         self.ak_secret = ak_secret
@@ -339,24 +329,8 @@ class ALiBaBaTTS(AbstractMp3TTSEngine):
 
     @classmethod
     def get_config(cls):
-        # FIXME: Replace this as soon as we have a config module
-        config = {}
         # Try to get ali_yuyin config from config
-        profile_path = dingdangpath.config('profile.yml')
-        if os.path.exists(profile_path):
-            with open(profile_path, 'r') as f:
-                profile = yaml.safe_load(f)
-                if 'ali_yuyin' in profile:
-                    if 'ak_id' in profile['ali_yuyin']:
-                        config['ak_id'] = \
-                            profile['ali_yuyin']['ak_id']
-                    if 'ak_secret' in profile['ali_yuyin']:
-                        config['ak_secret'] = \
-                            profile['ali_yuyin']['ak_secret']
-                    if 'voice_name' in profile['ali_yuyin']:
-                        config['voice_name'] = \
-                            profile['ali_yuyin']['voice_name']
-        return config
+        return config.get('ali_yuyin', {})
 
     @classmethod
     def is_available(cls):
@@ -425,7 +399,7 @@ class GoogleTTS(AbstractMp3TTSEngine):
 
     SLUG = "google-tts"
 
-    def __init__(self, language='en'):
+    def __init__(self, language='en', **args):
         super(self.__class__, self).__init__()
         self.language = language
 
@@ -437,19 +411,8 @@ class GoogleTTS(AbstractMp3TTSEngine):
 
     @classmethod
     def get_config(cls):
-        # FIXME: Replace this as soon as we have a config module
-        config = {}
-        # HMM dir
-        # Try to get hmm_dir from config
-        profile_path = dingdangpath.config('profile.yml')
-        if os.path.exists(profile_path):
-            with open(profile_path, 'r') as f:
-                profile = yaml.safe_load(f)
-                if ('google_yuyin' in profile and
-                   'language' in profile['google_yuyin']):
-                    config['language'] = profile['google_yuyin']['language']
-
-        return config
+        # Try to get google_yuyin from config
+        return config.get('google_yuyin', {})
 
     @property
     def languages(self):

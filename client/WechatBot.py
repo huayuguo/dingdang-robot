@@ -6,8 +6,9 @@ import os
 from client.wxbot import WXBot
 
 from client import dingdangpath
-from client.tts import SimpleMp3Player
 from client.audio_utils import mp3_to_wav
+from client import player
+from client import config
 
 
 class WechatBot(WXBot):
@@ -32,13 +33,13 @@ class WechatBot(WXBot):
 
     def handle_msg_all(self, msg):
         # ignore the msg when handling plugins
-        profile = self.brain.profile
+        profile = config.get()
         if (msg['msg_type_id'] == 1 and
            (msg['to_user_id'] == self.my_account['UserName'] or
                 msg['to_user_id'] == u'filehelper')):
             from_user = profile['first_name'] + '说：'
+            msg_data = from_user + msg['content']['data']
             if msg['content']['type'] == 0:
-                msg_data = from_user + msg['content']['data']
                 if msg_data.startswith(profile['robot_name_cn']+": "):
                     return
                 if self.music_mode is not None:
@@ -62,8 +63,7 @@ class WechatBot(WXBot):
                             mic.say("什么？")
                 else:
                     # 播放语音
-                    player = SimpleMp3Player()
-                    player.play_mp3(mp3_file)
+                    player.get_music_manager().play_block(mp3_file)
         elif msg['msg_type_id'] == 4:
             if 'wechat_echo_text_friends' in profile and \
                (
@@ -82,5 +82,4 @@ class WechatBot(WXBot):
                  ) and msg['content']['type'] == 4:
                 mp3_file = os.path.join(dingdangpath.TEMP_PATH,
                                         'voice_%s.mp3' % msg['msg_id'])
-                player = SimpleMp3Player()
-                player.play_mp3(mp3_file)
+                player.get_music_manager().play_block(mp3_file)
